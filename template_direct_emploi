@@ -1,0 +1,460 @@
+<?php
+
+/*
+Le but de ces batch (programme qu'on lance tous les jours le matin, de manière indépendante)
+est d'importer des offres d'emploi d'un sit d'un client dans notre propre BDD.
+On va donc chercher à extraire toutes les infos des différentes offres pour créer pour chaque offre
+une ligne dans la table "OffOffre" (ça sera la table la plus importante).
+Plusieurs champs sont à remplir, ils seront détaillés dans la suite du code.
+*/
+
+
+//HEADER NE PAS TOUCHER
+define('SF_ROOT_DIR',    realpath(dirname(__FILE__).'/../..'));
+define('SF_APP', 'direct_emploi');
+define('SF_ENVIRONMENT', 'prod');
+define('SF_DEBUG', true);
+
+require_once(SF_ROOT_DIR . DIRECTORY_SEPARATOR . 'apps' . DIRECTORY_SEPARATOR . SF_APP . DIRECTORY_SEPARATOR . 'config' . DIRECTORY_SEPARATOR . 'config.php');
+require_once(SF_ROOT_DIR . DIRECTORY_SEPARATOR . 'lib/pharse/pharse.php');
+require_once(SF_ROOT_DIR . DIRECTORY_SEPARATOR . 'lib/Imports_Tools.php');
+
+header('Content-Type: text/html; charset=UTF-8');
+sfContext:: getInstance();
+
+sfLoader::loadHelpers(array('Url', 'Date'));
+
+set_time_limit(0);
+error_reporting(E_ALL);
+
+
+//FONCTION UTILISEES DANS LE BATCH
+
+function extractEmailsFromString($sChaine)
+{
+    if (false !== preg_match_all('`\w(?:[-_.]?\w)*@\w(?:[-_.]?\w)*\.(?:[a-z]{2,4})`', $sChaine, $aEmails)) {
+        if (is_array($aEmails[0]) && sizeof($aEmails[0]) > 0) {
+            return array_unique($aEmails[0]);
+        }
+    }
+    return null;
+}
+
+function multiexplode($delimiters, $string)
+{
+
+    $ready = str_replace($delimiters, $delimiters[0], $string);
+    $launch = explode($delimiters[0], $ready);
+    return $launch;
+}
+//Permet de récupérer une chaine de caractères dans une variable spécifié, en précisant la chaine de début et la chaine de fin.
+function get_between($input, $start, $end)
+{
+  $substr = substr($input, strlen($start)+strpos($input, $start), (strlen($input) - strpos($input, $end))*(-1));
+  return $substr;
+}
+
+
+//VARIABLES
+$t_initial = time();
+$limit_nombre_integration = 100000;
+$nb_offres_importes = 0;
+$list_secteur = array();
+$nb_offres = 0;
+$tab = array();
+
+//VARIABLES INFOS DE CORRESPONDANCE MANQUANTES
+$secteur_manquant = array();
+$lieu_manquant = array();
+$formation_manquante = array();
+
+//Pour code des secteurs (ne pas toucher)
+$list_secteur = array();
+$sect = 0;
+
+
+//TABLEAU DE CORRESPONDANCE ENTRE NOM ET IDs DANS LA BDD
+//Type de contrat
+$corr_type_contrat = array(
+    'CDD' => 1,
+    'CDD ' => 1,
+    ' CDD ' => 1,
+    'CDI' => 2,
+    'CDI ' => 2,
+    ' CDI ' => 2,
+    'Interim' => 4,
+    'Interim ' => 4,
+    'Autre' => 4,
+    'Contrat Pro' => 6,
+    'Stage' => 8,
+    'Mission 6 mois' => 1,
+);
+
+//Lieu (important car on utilise souvent le même code pour faire le correspondance entre ville et code postaux
+//car toutes les villes ne sont pas forcément présentes dans la BDD)
+$corr_lieu = array(
+    'COLMAR 2' => '68000',
+    'COLMAR 1' => '68000',
+    'GEZIM' => '68000',
+    'GEZIM METZ' => '57000',
+    'SCHWANAU' => 'allemagne',
+    'EVENEMENTIEL STRASBOURG' => '67000',
+    'KEHL' => 'allemagne',
+    'LUXEMBOURG' => 'luxembourg',
+);
+//Mail (ça dépend des clients, des sites etc, c'est juste un exemple)
+$corr_mail = array(
+    'COLMAR 2' => 'colmar@gezim.fr',
+    'COLMAR 1' => 'colmar@gezim.fr',
+    'GEZIM' => 'colmar@gezim.fr',
+    'GEZIM METZ' => 'metz@gezim.fr',
+    'SCHWANAU' => 'kontakt@gezim.eu',
+    'EVENEMENTIEL STRASBOURG' => 'strasbourg@temporel.eu',
+    'KEHL' => 'kontakt@gezim.eu',
+    'LUXEMBOURG' => 'contact@gezim.lu',
+);
+
+$corr_formation = array(
+"CAP"=>array(6),
+"BAC /BAC + 2"=> array(2,8),
+"LICENCE"=>array(9),
+"BTS/DUT/LICENCE PRO/CAP"=>array(8,9,6),
+"BAC" =>array(2),
+"BAC PRO"=>array(7),
+"BAC + 2"=>array(8),
+"BAC +3/4"=>array(9,10),
+"BTS/DUT"=>array(8),
+"BAC +2"=>array(8),
+"CAP/BAC PRO/BAC + 2"=>array(6,7,8),
+"BAC PRO/BAC PRO"=>array(7),
+"CAP/CAP"=>array(6)
+ );
+//ETC, des tableaux de correspondances peuvent être utiles pour plusieurs champs de notre BDD
+
+
+//Tableau contenant les informations du client
+// (tableau de tableaux dans le cas où il y a pls client en même temps)
+$urls = array(
+    array(
+        // NomClient (???) :
+        'url' => 'http://www.nomclient.fr/toutes-les-offres/',
+        //Url de la page contenant les offres du client
+        'id_user' => '???',
+        //'id_user' => '1036679', ID DE TEST POUR LE LOCAL, User qui est sûr d'être présent sur ton local
+        'name' => 'NomClient',
+    ),
+);
+
+//Première boucle qui parcourt les clients pour faire le traitement
+foreach ($urls as $array) {
+    $UserUser = UserUserPeer::retrieveByPK($array['id_user']);
+    // echo "\r\n";
+    if (!$UserUser) {
+        echo 'Erreur : l utilisateur n est pas reconnu : ' . $array['id_user'];
+        continue;
+    }
+
+    //Code de CURL : Recupération de la page web dans une variable $response
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $array['url']);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 6.2) AppleWebKit/536.6 (KHTML, like Gecko) Chrome/20.0.1090.0 Safari/536.6\')');
+    $response = curl_exec($ch);
+    $error = curl_error($ch);
+    curl_close($ch);
+    //echo $response;
+
+    //Parse de la page web dans une autre variable $html qui pourra être lue à l'aide de balises html
+    // Parse the google code website into a DOM
+    $html = Pharse::str_get_dom($response);//$html = Pharse::file_get_dom($array ['url']);
+
+    //variable out servira à afficher des messages à la fin de l'execution
+    $out = '';
+    $out .= "<br/><br/>START id_client : " . $array['id_user'] . " - Nom_client : " . $array['name'] . "<br/><br/>";
+
+
+    /*A partir d'ici il va y avoir plusieurs étapes :
+
+    - Récupérer le nombre de pages d'offres à l'aide de la variable test
+
+    - Créer un tableau $tab contenant les urls de toutes les pages d'offres (pages 1, 2, 3 etc ...)
+
+    - Trouver les balises html correspondantes aux offres une par une pour créer un tableau $path
+    contenant les balises qui nous interessent
+    */
+
+    //Réupération du nombre de pages
+
+
+    /*Une information se récupère de la manière suivante :
+    $test = $html('balise[class="qqchose"], index)
+        $html        : au fichier DOM (page internet parsée)
+        balise       : span/div/h1 ...
+        class/id ... : est la class ou attribut spécifique permettant de retrouver l'élément
+        index        : index de l'élément (commence à 0)
+
+
+    Puis avec ta variable $test tu as plusieurs méthodes :
+        $test->getPlainText() : récupérer le texte brut
+        $test->getInnerText() : récupérer le texte avec les balises html
+        $test->getAttribute('href') : récupérer l'attribut 'href' (exemple)
+    */
+
+    //Exemple
+    $test = $html('p[class=results]', 0);
+    $nb_offres = preg_replace('`[^0-9]`', '', $test->getPlainText());
+    //echo '<br>' . $nb_offres;
+    $limite = ceil($nb_offres / 10);
+    //echo '<br>' . $limite;
+
+    //Création du tableau
+    $url_a_completer = 'http://www.nomclient.fr/toutes-les-offres/page/';
+    $tab[0] = $array['url'];
+    for ($p = 2; $p < $limite + 1; $p++) {
+        $tab[] = $url_a_completer . $p . '/';
+    }
+
+    //Série de test pour obtenir les balises des offres
+    $test = $html('div[class="col-lg-12"]', 1);
+    //echo '<br>' . $test->getPlainText();
+    //echo '<br>' . $test('a', 0)->getAttribute('href');
+    //echo '<br>' . $test('div[class="hidden-xs hidden-sm inner-vign"]', 0)->getPlainText();
+
+    //Balises utilisé
+    $path = array(
+        "div[class=\"col-lg-12\"]",
+        //élément
+        "a",
+        //Sous-élément contenant le lien
+    );
+
+    //Utilisation de fonction présent dans le fichier Crawl_Tool pour générer les boucles
+    $test = new Crawl($tab, 6, $path);
+    //méthode constructTabForUrlGetMethod() prend en argument la balise d'un sous-élément si nécessaire (exemple lieu ou secteur)
+    //mais aussi une chaine de caractère à placer avant ou après les URLs des offres
+    $info = $test->constructTabForUrlGetMethod('div[class="hidden-xs hidden-sm inner-vign"]', "", "");
+    //$link : tableau contenant toutes les URLs (URL dans info[0])
+    $link = $info[0];
+    //secteur_tab : ici secteur mais cela peut être n'importe quelle info (info supplémentaire dans info[1])
+    $secteur_tab = $info[1];
+
+
+
+    $tests = new Crawl($link, 6);
+    $tests->scraping();
+    $fin_crawl = time();
+    $DlContent = $tests->getDlcontent();
+    $compteur = 0;
+    $datas = array();
+
+    //PARCOURS DE TOUTES LES OFFRES//
+    //Cette boucle parcourt toutes les urls des offres pour réaliser un curl et un parse
+    //notre variable $html contiendra donc les pages de chaque offre à chaque itération de la boucle
+    foreach ($DlContent as $index => $value) {
+
+        if ($value['info']['http_code'] == 200) {
+            $compteur++;
+            //echo '<br>' . $value['return'];
+            $html = Pharse::str_get_dom($value['return']);
+            $compt = 0;
+            foreach ($link as $ur) {
+                if ($ur == $value['info']['url']) {
+                    //Ici on crée une variable contenant l'info supplémentaire
+                    $secteur = trim($secteur_tab[$compt]);
+                    break;
+                } else {
+                    $compt++;
+                }
+            }
+            $data = array();
+
+            /*Ici nous allons récupérer toutes les informations nécessaires pour entrer les offres dans notre BDD
+            Voici la liste des champs à remplir (pas tous nécessaire), on remplit la variable tableau $data :
+               data['intitule']=titre
+               data['reference']= reference de l'offre
+               data['id_type_contrat']= id du type de contract CDI par défault
+               data['geo_ville']= nom de la ville
+               data['mission']=nom de la mission
+               data['searched_profile']= decription profile
+               data['id_secteurs']= array des id des secteurs principaux ( type array ) egal a array(31) s'il n'est pas defini
+               data['id_sous_secteurs']=array des id des sous secteurs Nul Par Default (NPD)
+               data['postale_code']=code postale de la ville( a 5 chiffres)
+               data['rep_url']= url de réponse ( ne pas oublier le traqueur )/ le mettre null pour avoir rep_mail
+               data['rep_mail']= mail de reponse ( null si rep_url est définie NPD
+               data['id_fourchette_remuneration']= id du salaire/int/ NPD
+               data['date_debut_contrat']= date de début du contrat  NPD
+               data['duree_contrat']= durée du contrat / string / NPD
+               data['id_experience_requise']= experience requise/int  /NPD
+               data['id_type_formation']= formation requise/ array /Non définie par défault
+               data['nom_societe']= nom de la societe égal a user_name
+               data['handicap'] = poste ouvert aux handicapés ou non / NPD
+               data['anonym'] = offre anonyme ? / NPD
+               data['id_pays']= id du pays de l'offre, définie sur France par défault
+               data['id_region']= id de la region de l'offre s'il n'y a ni CP ni dep / non defini par défault
+            */
+
+            //LE CODE CI DESSOUS EST UN EXEMPLE
+
+            //REP_URL
+            $data['rep_url'] = $value['info']['url'];
+            //echo '<br>' . $data['rep_url'];
+
+
+            //INTITULE
+            $data['intitule'] = trim($html('h1[class="entry-title"]', 0)->getPlainText());
+            //echo '<br>' . $data['intitule'];
+
+
+            //REFERENCE
+            $data['reference'] = $html('span[class="item-value item-value-vacancy_ref"]', 0)->getPlainText();
+            //echo'<br>' . $data['reference'];
+
+
+            //LIEU
+            $lieu = $html('span[class="item-value item-value-vac_ville"]', 0)->getPlainText();
+            //echo'<br>' . $lieu;
+            $postal_code = codePostal($lieu, $corr_lieu);
+            if (preg_match('`[0-9]{5}`', $postal_code) == false) {
+                //echo '<br>\'' . $postal_code . '\' => \'\',';
+                //echo '<br>' . $data['rep_url'];
+            }
+            if ($postal_code == 'portugal') {
+                $data['id_pays'] = array(62);
+                $postal_code = "";
+            } elseif (preg_match('`[0-9]{5}`', $postal_code) == false) {
+                $lieu_manquant[] = $postal_code;
+                $postal_code = "";
+            }
+
+            $data['geo_ville'] = $lieu;
+            $data['postale_code'] = $postal_code;
+            //echo'<br>' . $data['geo_ville'];
+            //echo'<br>' . $data['postale_code'];
+
+
+            //EXP
+            $exp = $html('span[class="item-value item-value-vac_xp"]', 0)->getPlainText();
+            $data['id_experience_requise'] = $corr_exp[$exp];
+            //echo'<br>' . $data['id_experience_requise'];
+
+
+            //FORMATION
+            $formation = $html('span[class="item-value item-value-vac_diplome"]', 0)->getPlainText();
+            $formation_array = explode(' ; ', $formation);
+            foreach ($formation_array as $item)
+            {
+                $item = trim($item);
+                //echo '<br>\'' . $item . '\' => \'\',';
+                if($corr_formation[$item] && $corr_formation[$item] != -1)
+                {
+                    $data['id_type_formation'][] = $item;
+                }
+                elseif($corr_formation[$item] == -1)
+                {
+                    $data['id_type_formation'][] = null;
+                }
+                else
+                {
+                    $formation_manquante[] = $item;
+                    $data['id_type_formation'][] = null;
+                }
+            }
+            //echo'<br>';
+            //var_dump($data['id_type_formation']);
+
+
+            //SEARCHED_PROFILE
+            $profil = $html('div[class="text field-value-vac_profile"]', 0)->getInnerText();
+            //Seconde façon de cacher une adresse mail, à utiliser si cacherAdresseMail ne fonctionne pas
+            $profil = str_replace('@derichebourg.com', '@****', $profil);
+            $profil = str_replace('@DERICHEBOURG.COM', '@****', $profil);
+            $profil = str_replace('&nbsp;', '', $profil);
+            $profil = str_replace('<br>', '', $profil);
+            $profil = str_replace(PHP_EOL, '', $profil);
+            $data['searched_profile'] = $profil;
+            //echo'<br>' . $data['searched_profile'];
+
+
+            //MISSION
+            $mission = trim($html('div[class="entry-content"]', 0)->getInnerText());
+            //Ligne qui permet de cacher les numéros de téléphone
+            $mission = preg_replace('`[0-9]{2}\s?.?[0-9]{2}\s?.?[0-9]{2}\s?.?[0-9]{2}\s?.?[0-9]{2}`', '', $mission);
+            //Première façon de cacher une adresse mail
+            $mission = cacherAdresseMail($mission);
+            $data['mission'] = str_replace(PHP_EOL, '', $mission);
+            //echo'<br>' . $data['mission'];
+            //echo'<br>' . $data['rep_mail'];
+
+
+            //REFERENCE EXEMPLE NUMERO 2 SI IL N'Y A PAS DE REF DIRECTEMENT SUR LE SITE
+            $ref = md5($data['mission']);
+            $data['reference'] = $ref[0].$ref[1].$ref[2].$ref[3].$ref[4];
+
+
+            //TYPE CONTRAT
+            $type_contrat = $html('span[class="item-value item-value-vac_type"]', 0);
+            $data['id_type_contrat'] = $corr_type_contrat[$type_contrat];
+            if($data['id_type_contrat'] == -1)
+            {
+                if (stripos($data['mission'], 'CDI') !== false) {
+                    $data['id_type_contrat'] = 2;
+                } elseif (stripos($data['mission'], 'CDD') !== false) {
+                    $data['id_type_contrat'] = 1;
+                } else {
+                    $data['id_type_contrat'] = 4;
+                }
+            }
+            //echo '<br>contrat : ' . $data['id_type_contrat'];
+
+            // Ici on récupère le secteur des offres et qui seront mis dans la bdd via la fonction remplirTableScriptSecteursAll. Si le secteur n'est pas précisé dans l'offre prenez son intitulé.
+            // SECTEUR
+            $secteur = $data['intitule'];
+            // echo'<br>' . $secteur;
+            $secteur_array = remplirTableScriptSecteursAll($secteur, $array['id_user'],$data['intitule']);
+            $data['id_secteurs'] = $secteur_array[0];
+            $data['id_sous_secteurs'] = $secteur_array[1];
+            //echo '<br>';
+            //var_dump($data['id_secteurs']);
+
+
+            //INFORMATIONS NON FOURNIES
+            $data['searched_profile'] = null;
+            $data['date_debut'] = null;
+            $data['duree_contrat'] = null;
+            $data['rep_url'] = null;
+            $data['id_experience_requise'] = array(null);
+            $data['id_fourchette_remuneration'] = null;
+
+
+            $datas[] = $data;
+            //On met $data qui contient toutes les infos pour une offre dans $datas qui regroupe tt les offres
+            //echo '<br>________________________________________________';*/
+
+        }
+    }
+    //Sauvegarde des information dans la base de donnée
+    $info = saveInDatabase($datas, $array['id_user'], $array['name']);
+    $fin = time();
+    $out .= $info[0];
+    $out= supprimerOffres($out,$offreMaj,$offreCrees,$info[1],$array['id_user']);
+
+}
+
+
+$t_final = time();
+$out .= "<br>temps total = " . time_elapsed_A($t_final - $t_initial);
+
+
+//Messages affichés à la fin pour les lieux/formations etc manquants
+$out .= "<br/> <br/> Lieux manquants : ";
+foreach ($lieu_manquant as $lieu)
+    $out .= '<br>' . $lieu . ' => ,';
+
+//affichage du message final
+//echo $out;
+
+
+// Commenter ces deux lignes durant vos tests pour ne pas bug
+// Changer le NomClient par le nom de l'entreprise
+envoyerMail($out,"NomClient",$offreMaj,$offreCrees);
+saveInfoScript("NomClient",$out,$subject,$offreSupprimees,$offreMaj,$offreCrees);
